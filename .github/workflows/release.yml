@@ -1,0 +1,107 @@
+name: release
+
+# Triggered ONLY on a pushed version tag (v*) from `scripts/release.sh` (or
+# `nix run .#release`). Runs on remote-cli's repo-scoped persistent NixOS
+# runners ([self-hosted, nix, x86_64-linux]) rather than the azure-ephemeral
+# pool, which has no runners registered against this repo (bd-26bdac). Nix +
+# flakes provide all toolchains (including `gh`, via `nix run nixpkgs#gh`). The
+# only dependency (mcp-cli) is PUBLIC over HTTPS, so no SSH key/secret is needed.
+#
+# A library has no per-target binary assets (unlike a CLI). The release flow is:
+#   1. resolve  — derive the tag/version once.
+#   2. test     — run the full suite so a release is never cut from red.
+#   3. publish  — create/update the GitHub Release for the tag. If a crates.io
+#                 token (secrets.CARGO_REGISTRY_TOKEN) is configured, also
+#                 `cargo publish`; otherwise the tag + Release is the artifact.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish"
+        required: false
+        type: string
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    name: resolve release context
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.ctx.outputs.tag }}
+      version: ${{ steps.ctx.outputs.version }}
+    steps:
+      - id: ctx
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test suite
+    needs: resolve
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run the full suite
+        shell: bash
+        run: |
+          nix --version
+          nix flake check --no-write-lock-file
+
+  publish:
+    name: publish release
+    needs:
+      - resolve
+      - test
+    runs-on: [self-hosted, nix, x86_64-linux]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create or update the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # `gh` is not on the secretless runner image — get it from Nix.
+          if ! nix run nixpkgs#gh -- release view "$TAG" >/dev/null 2>&1; then
+            nix run nixpkgs#gh -- release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+              --notes "remote-cli $TAG" || true
+          fi
+
+      # Optional crates.io publish: only runs when the token secret is present,
+      # so the workflow stays green for forks/private mirrors without one.
+      # (remote-cli has a git dep, which crates.io disallows, so this path is
+      # effectively a no-op until that dep is published; the tag + GitHub Release
+      # is the real artifact.)
+      - name: Publish to crates.io (if token configured)
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "no CARGO_REGISTRY_TOKEN; skipping cargo publish (tag + Release is the artifact)"
+            exit 0
+          fi
+          nix develop --command cargo publish --no-verify
