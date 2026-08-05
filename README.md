@@ -10,8 +10,8 @@ parts:
 
 - generic typed JSON snapshots with monotonic revisions;
 - owner-only atomic cache replacement and cache file watching;
-- authenticated `GET /snapshot`, `GET /events`, `GET /health`, and
-  `POST /refresh?domain=...`;
+- authenticated `GET /snapshot`, `GET /events`, `GET /health`,
+  `POST /refresh?domain=...`, and an optional typed `POST /command` conduit;
 - remote HTTP(S) SSE or owner-local `unix:///absolute/path.sock` using the same
   protocol;
 - daemon-to-client cache write-through and revision deduplication;
@@ -56,7 +56,10 @@ daemon:
 ```
 
 Bearer authentication remains mandatory on Unix sockets, ensuring identical
-behavior when a configuration changes from local to remote transport.
+behavior when a configuration changes from local to remote transport. The
+optional command conduit lets a host keep source credentials, semantic queries,
+and confirmation-gated mutations inside its single persistent daemon rather
+than spawning an upstream client from every CLI/MCP process.
 
 ## Nix service mixin
 
