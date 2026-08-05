@@ -18,11 +18,12 @@ pub use auth::{load_or_create_token, read_token};
 pub use cache::CacheStore;
 pub use client::{
     ClientHealth, ClientOptions, ClientSubscription, ClientUpdate, FallbackLease, fetch_json,
-    request_refresh,
+    post_json, request_refresh,
 };
 pub use config::{ClientConfig, DaemonConfig};
 pub use endpoint::Endpoint;
 pub use server::{
-    ProjectedResponse, ServerHandle, ServerOptions, SharedSnapshot, SnapshotProjector, start_server,
+    CommandHandler, CommandRequest, ProjectedResponse, ServerHandle, ServerOptions, SharedSnapshot,
+    SnapshotProjector, start_server,
 };
 pub use snapshot::{Snapshot, unix_now};

@@ -35,6 +35,18 @@ pub type SnapshotProjector<S> =
     Arc<dyn Fn(&S, &str, &str) -> Option<ProjectedResponse> + Send + Sync + 'static>;
 pub type RefreshValidator<S> = Arc<dyn Fn(&S, &str) -> bool + Send + Sync + 'static>;
 pub type HealthProjector<S> = Arc<dyn Fn(&S) -> ProjectedResponse + Send + Sync + 'static>;
+pub type CommandHandler = Arc<
+    dyn Fn(&str, serde_json::Value) -> std::result::Result<serde_json::Value, String>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+pub struct CommandRequest {
+    pub operation: String,
+    pub input: serde_json::Value,
+}
 
 /// Single-writer state shared by a host collector and transport threads.
 pub struct SharedSnapshot<S: Snapshot> {
@@ -129,6 +141,9 @@ pub struct ServerOptions<S: Snapshot> {
     pub projector: Option<SnapshotProjector<S>>,
     pub refresh_validator: RefreshValidator<S>,
     pub health_projector: Option<HealthProjector<S>>,
+    /// Optional authenticated application-command conduit. Hosts use this to
+    /// keep credentials and source mutations inside the single daemon process.
+    pub command_handler: Option<CommandHandler>,
 }
 
 impl<S: Snapshot> ServerOptions<S> {
@@ -142,6 +157,7 @@ impl<S: Snapshot> ServerOptions<S> {
             projector: None,
             refresh_validator: Arc::new(|_, domain| !domain.is_empty()),
             health_projector: None,
+            command_handler: None,
         }
     }
 }
@@ -295,6 +311,7 @@ fn accept_unix<S: Snapshot>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_connection<S, T>(
     mut stream: T,
     options: &ServerOptions<S>,
@@ -362,6 +379,41 @@ where
             )
         }
         ("GET", "/events") => serve_sse(stream, &options.shared, stop),
+        ("POST", "/command") => {
+            let Some(handler) = &options.command_handler else {
+                return write_http_response(
+                    &mut stream,
+                    "404 Not Found",
+                    "text/plain",
+                    b"command conduit disabled\n",
+                );
+            };
+            let command: CommandRequest = match serde_json::from_slice(&request.body) {
+                Ok(command) => command,
+                Err(error) => {
+                    return write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        &serde_json::to_vec(&serde_json::json!({"error": error.to_string()}))?,
+                    );
+                }
+            };
+            match handler(&command.operation, command.input) {
+                Ok(output) => write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &serde_json::to_vec(&output)?,
+                ),
+                Err(error) => write_http_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    &serde_json::to_vec(&serde_json::json!({"error": error}))?,
+                ),
+            }
+        }
         ("POST", "/refresh") => {
             let domain = query_parameter(&request.path, "domain").unwrap_or_default();
             let snapshot = options.shared.snapshot();
@@ -390,25 +442,27 @@ struct HttpRequest {
     method: String,
     path: String,
     headers: BTreeMap<String, String>,
+    body: Vec<u8>,
 }
 
 fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
-    while bytes.len() < HTTP_READ_LIMIT {
+    let header_end = loop {
+        if bytes.len() >= HTTP_READ_LIMIT {
+            bail!("HTTP request exceeds {HTTP_READ_LIMIT} bytes");
+        }
         let read = stream.read(&mut chunk)?;
         if read == 0 {
-            break;
+            bail!("HTTP request ended before headers");
         }
         bytes.extend_from_slice(&chunk[..read]);
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
+        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
         }
-    }
-    if bytes.len() >= HTTP_READ_LIMIT {
-        bail!("HTTP request headers exceed {HTTP_READ_LIMIT} bytes");
-    }
-    let text = std::str::from_utf8(&bytes).context("HTTP request is not UTF-8")?;
+    };
+    let header_bytes = &bytes[..header_end];
+    let text = std::str::from_utf8(header_bytes).context("HTTP request is not UTF-8")?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().context("missing HTTP request line")?;
     let mut parts = request_line.split_whitespace();
@@ -417,15 +471,33 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest> {
         bail!("only GET and POST are supported");
     }
     let path = parts.next().context("missing HTTP path")?.to_string();
-    let headers = lines
+    let headers: BTreeMap<String, String> = lines
         .take_while(|line| !line.is_empty())
         .filter_map(|line| line.split_once(':'))
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect();
+    let content_length = headers
+        .get("content-length")
+        .map_or(Ok(0_usize), |value| value.parse::<usize>())
+        .context("invalid Content-Length")?;
+    let body_start = header_end + 4;
+    let request_length = body_start.saturating_add(content_length);
+    if request_length > HTTP_READ_LIMIT {
+        bail!("HTTP request exceeds {HTTP_READ_LIMIT} bytes");
+    }
+    while bytes.len() < request_length {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            bail!("HTTP request body ended early");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+    let body = bytes[body_start..request_length].to_vec();
     Ok(HttpRequest {
         method,
         path,
         headers,
+        body,
     })
 }
 

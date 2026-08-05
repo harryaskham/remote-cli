@@ -512,7 +512,7 @@ pub fn request_refresh(endpoint: &str, token_path: &Path, domain: &str) -> Resul
         }
         #[cfg(unix)]
         Endpoint::Unix(socket) => {
-            let response = unix_request(&socket, "POST", &path, &token, false)?;
+            let response = unix_request(&socket, "POST", &path, &token, &[])?;
             ensure_http_success(&response, "daemon refresh rejected")?;
             Ok(())
         }
@@ -538,9 +538,42 @@ pub fn fetch_json<T: DeserializeOwned>(endpoint: &str, token_path: &Path, path: 
             .context("decode daemon snapshot"),
         #[cfg(unix)]
         Endpoint::Unix(socket) => {
-            let response = unix_request(&socket, "GET", path, &token, false)?;
+            let response = unix_request(&socket, "GET", path, &token, &[])?;
             let body = ensure_http_success(&response, "daemon snapshot rejected")?;
             serde_json::from_slice(body).context("decode daemon snapshot")
+        }
+    }
+}
+
+pub fn post_json<I: serde::Serialize, O: DeserializeOwned>(
+    endpoint: &str,
+    token_path: &Path,
+    path: &str,
+    input: &I,
+) -> Result<O> {
+    let endpoint = Endpoint::parse(endpoint)?;
+    let token = read_token(token_path)?;
+    match endpoint {
+        Endpoint::Http(base) => Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()?
+            .post(format!("{base}{path}"))
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header(ACCEPT, "application/json")
+            .json(input)
+            .send()
+            .context("request daemon command")?
+            .error_for_status()
+            .context("daemon command rejected")?
+            .json()
+            .context("decode daemon command response"),
+        #[cfg(unix)]
+        Endpoint::Unix(socket) => {
+            let input = serde_json::to_vec(input).context("encode daemon command")?;
+            let response = unix_request(&socket, "POST", path, &token, &input)?;
+            let body = ensure_http_success(&response, "daemon command rejected")?;
+            serde_json::from_slice(body).context("decode daemon command response")
         }
     }
 }
@@ -642,7 +675,7 @@ fn remote_unix_session<S: Snapshot>(
     stop: &AtomicBool,
 ) -> Result<()> {
     use std::os::unix::net::UnixStream;
-    let response = unix_request(socket, "GET", "/snapshot", token, false)?;
+    let response = unix_request(socket, "GET", "/snapshot", token, &[])?;
     let body = ensure_http_success(&response, "daemon snapshot rejected")?;
     let initial: S = serde_json::from_slice(body).context("decode daemon snapshot")?;
     tx.send(SourceEvent::DaemonUp)?;
@@ -712,7 +745,7 @@ fn unix_request(
     method: &str,
     path: &str,
     token: &str,
-    keep_open: bool,
+    body: &[u8],
 ) -> Result<Vec<u8>> {
     use std::os::unix::net::UnixStream;
     let mut stream = UnixStream::connect(socket)
@@ -720,12 +753,12 @@ fn unix_request(
     stream.set_read_timeout(Some(Duration::from_secs(45)))?;
     write!(
         stream,
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     )?;
+    stream.write_all(body)?;
     stream.flush()?;
-    if !keep_open {
-        stream.shutdown(std::net::Shutdown::Write)?;
-    }
+    stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     Ok(response)
@@ -955,11 +988,29 @@ mod tests {
         options.bind = None;
         options.unix_socket = Some(socket.clone());
         options.refresh_validator = Arc::new(|_, domain| domain == "mail");
+        options.command_handler = Some(Arc::new(|operation, input| {
+            if operation == "echo" {
+                Ok(input)
+            } else {
+                Err("unknown operation".into())
+            }
+        }));
         let _handle = start_server(options).unwrap();
         let endpoint = format!("unix://{}", socket.display());
         let state: State = fetch_json(&endpoint, &token_path, "/snapshot").unwrap();
         assert_eq!(state.revision, 0);
         request_refresh(&endpoint, &token_path, "mail").unwrap();
         assert_eq!(shared.take_refresh_request().as_deref(), Some("mail"));
+        let output: serde_json::Value = post_json(
+            &endpoint,
+            &token_path,
+            "/command",
+            &crate::CommandRequest {
+                operation: "echo".into(),
+                input: serde_json::json!({"hello": "world"}),
+            },
+        )
+        .unwrap();
+        assert_eq!(output["hello"], "world");
     }
 }
