@@ -5,13 +5,14 @@
   binary ? appName,
   defaultBind,
   description ? "${displayName} cache collector",
+  darwinCacheBase ? "Library/Caches",
 }:
 let
   commonOptions =
-    { lib, pkgs, home, systemd ? false }:
+    { lib, pkgs, home, systemd ? false, cacheBase ? ".cache" }:
     let
       defaultConfig = if systemd then "%h/.config/${appName}/config.yaml" else "${home}/.config/${appName}/config.yaml";
-      defaultCache = if systemd then "%h/.cache/${appName}/state.json" else "${home}/.cache/${appName}/state.json";
+      defaultCache = if systemd then "%h/.cache/${appName}/state.json" else "${home}/${cacheBase}/${appName}/state.json";
     in
     {
       enable = lib.mkEnableOption description;
@@ -112,7 +113,10 @@ in
       args = mkArgs lib cfg;
     in
     {
-      options.services.${appName} = commonOptions { inherit lib pkgs home; };
+      options.services.${appName} = commonOptions {
+        inherit lib pkgs home;
+        cacheBase = darwinCacheBase;
+      };
       config = lib.mkIf cfg.enable {
         environment.systemPackages = [ cfg.package ];
         launchd.user.agents."${appName}-daemon" = {
