@@ -259,7 +259,7 @@ fn accept_tcp<S: Snapshot>(
                 let options = Arc::clone(&options);
                 let stop = Arc::clone(&stop);
                 thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                     if let Err(error) = serve_connection(stream, &options, &stop) {
                         eprintln!(
@@ -293,7 +293,7 @@ fn accept_unix<S: Snapshot>(
                 let options = Arc::clone(&options);
                 let stop = Arc::clone(&stop);
                 thread::spawn(move || {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
                     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
                     if let Err(error) = serve_connection(stream, &options, &stop) {
                         eprintln!("{} daemon: Unix client failed: {error:#}", S::APP_NAME);
