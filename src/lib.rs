@@ -11,6 +11,7 @@ pub mod cache;
 pub mod client;
 pub mod config;
 pub mod endpoint;
+pub mod logs;
 pub mod server;
 pub mod snapshot;
 
@@ -22,6 +23,7 @@ pub use client::{
 };
 pub use config::{ClientConfig, DaemonConfig};
 pub use endpoint::Endpoint;
+pub use logs::{DaemonLogOptions, LogStream, show_daemon_logs};
 pub use server::{
     CommandHandler, CommandRequest, ProjectedResponse, ServerHandle, ServerOptions, SharedSnapshot,
     SnapshotProjector, start_server,
