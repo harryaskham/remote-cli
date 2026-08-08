@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -144,6 +144,12 @@ pub struct ServerOptions<S: Snapshot> {
     /// Optional authenticated application-command conduit. Hosts use this to
     /// keep credentials and source mutations inside the single daemon process.
     pub command_handler: Option<CommandHandler>,
+    /// When the explicit `bind` is a specific, non-loopback, non-wildcard
+    /// address (e.g. a Tailscale IP), the server ALSO binds the matching
+    /// loopback alias (`127.0.0.1`/`::1`) on the same port by default, so
+    /// local `127.0.0.1` clients keep working without exposing the wildcard
+    /// LAN. Set this to opt out of the automatic loopback alias.
+    pub disable_default_loopback: bool,
 }
 
 impl<S: Snapshot> ServerOptions<S> {
@@ -158,12 +164,16 @@ impl<S: Snapshot> ServerOptions<S> {
             refresh_validator: Arc::new(|_, domain| !domain.is_empty()),
             health_projector: None,
             command_handler: None,
+            disable_default_loopback: false,
         }
     }
 }
 
 pub struct ServerHandle {
     pub http_address: Option<SocketAddr>,
+    /// Address of the automatic loopback alias, when one was bound alongside a
+    /// non-loopback `http_address` (see `ServerOptions::disable_default_loopback`).
+    pub loopback_address: Option<SocketAddr>,
     pub unix_socket: Option<PathBuf>,
     stop: Arc<AtomicBool>,
 }
@@ -190,6 +200,7 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
     let stop = Arc::new(AtomicBool::new(false));
     let shared_options = Arc::new(options);
     let mut http_address = None;
+    let mut loopback_address = None;
 
     if let Some(bind) = shared_options
         .bind
@@ -198,12 +209,26 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
     {
         let listener = TcpListener::bind(bind)
             .with_context(|| format!("bind {} daemon HTTP server at {bind}", S::DISPLAY_NAME))?;
-        listener.set_nonblocking(true)?;
-        let address = listener.local_addr().context("read daemon HTTP address")?;
+        let address = spawn_tcp_listener(listener, &shared_options, &stop)?;
         http_address = Some(address);
-        let options = Arc::clone(&shared_options);
-        let listener_stop = Arc::clone(&stop);
-        thread::spawn(move || accept_tcp(listener, options, listener_stop));
+
+        // Default loopback alias: a specific non-loopback bind (e.g. a Tailscale
+        // IP) ALSO serves the matching loopback address on the same port, so
+        // `127.0.0.1` local access keeps working without binding the wildcard
+        // `0.0.0.0` (which would expose the LAN). Opt out via
+        // `disable_default_loopback`.
+        if !shared_options.disable_default_loopback {
+            if let Some(loop_addr) = default_loopback_alias(address) {
+                let listener = TcpListener::bind(loop_addr).with_context(|| {
+                    format!(
+                        "bind {} daemon loopback alias at {loop_addr}",
+                        S::DISPLAY_NAME
+                    )
+                })?;
+                let address = spawn_tcp_listener(listener, &shared_options, &stop)?;
+                loopback_address = Some(address);
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -242,9 +267,58 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
     }
     Ok(ServerHandle {
         http_address,
+        loopback_address,
         unix_socket,
         stop,
     })
+}
+
+/// Bind bookkeeping shared by the explicit HTTP listener and its optional
+/// loopback alias: set non-blocking, read the resolved address, and spawn the
+/// accept loop.
+fn spawn_tcp_listener<S: Snapshot>(
+    listener: TcpListener,
+    shared_options: &Arc<ServerOptions<S>>,
+    stop: &Arc<AtomicBool>,
+) -> Result<SocketAddr> {
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr().context("read daemon HTTP address")?;
+    let options = Arc::clone(shared_options);
+    let listener_stop = Arc::clone(stop);
+    thread::spawn(move || accept_tcp(listener, options, listener_stop));
+    Ok(address)
+}
+
+/// Compute the loopback alias to bind alongside an explicit, resolved HTTP
+/// address. Returns `None` when the explicit address already covers loopback
+/// (loopback or wildcard/unspecified) or uses an ephemeral (`0`) port, so the
+/// alias never double-binds a port the primary listener already owns.
+fn default_loopback_alias(address: SocketAddr) -> Option<SocketAddr> {
+    if address.port() == 0 {
+        return None;
+    }
+    match address.ip() {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() {
+                None
+            } else {
+                Some(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    address.port(),
+                ))
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                None
+            } else {
+                Some(SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::LOCALHOST),
+                    address.port(),
+                ))
+            }
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -703,5 +777,134 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
+    /// Discover a routable non-loopback IPv4 for this host without sending any
+    /// packets (a connected UDP socket only consults the routing table).
+    /// Returns `None` on hosts with no such address so the positive-path tests
+    /// skip cleanly instead of flaking.
+    fn discover_nonloopback_ipv4() -> Option<IpAddr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("8.8.8.8:80").ok()?;
+        let ip = sock.local_addr().ok()?.ip();
+        if ip.is_loopback() || ip.is_unspecified() {
+            None
+        } else {
+            Some(ip)
+        }
+    }
+
+    /// Claim then release an ephemeral port so a concrete (non-zero) port is
+    /// available for the dual-bind positive tests (the loopback alias is only
+    /// added for a concrete port).
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    #[test]
+    fn default_loopback_alias_only_for_specific_nonloopback() {
+        // Loopback / wildcard already cover 127.0.0.1, so no extra alias.
+        assert_eq!(
+            default_loopback_alias("127.0.0.1:7634".parse().unwrap()),
+            None
+        );
+        assert_eq!(
+            default_loopback_alias("0.0.0.0:7634".parse().unwrap()),
+            None
+        );
+        assert_eq!(default_loopback_alias("[::1]:7634".parse().unwrap()), None);
+        assert_eq!(default_loopback_alias("[::]:7634".parse().unwrap()), None);
+        // An ephemeral (0) port cannot be matched by a fixed alias.
+        assert_eq!(
+            default_loopback_alias("100.103.121.27:0".parse().unwrap()),
+            None
+        );
+        // A specific non-loopback address gets a same-port loopback alias.
+        assert_eq!(
+            default_loopback_alias("100.103.121.27:7634".parse().unwrap()),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7634))
+        );
+        assert_eq!(
+            default_loopback_alias("[fd7a:1::2]:7634".parse().unwrap()),
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 7634))
+        );
+    }
+
+    #[test]
+    fn loopback_primary_bind_has_no_extra_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(State::default(), store));
+        let token = "x".repeat(64);
+        let mut options = ServerOptions::new(Arc::clone(&shared), token);
+        options.bind = Some("127.0.0.1:0".into());
+        let handle = start_server(options).unwrap();
+        assert!(handle.http_address.is_some());
+        assert!(handle.loopback_address.is_none());
+    }
+
+    #[test]
+    fn nonloopback_bind_also_serves_loopback_by_default() {
+        let Some(ip) = discover_nonloopback_ipv4() else {
+            return;
+        };
+        let port = free_port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(
+            State {
+                value: "hi".into(),
+                ..State::default()
+            },
+            store,
+        ));
+        let token = "x".repeat(64);
+        let mut options = ServerOptions::new(Arc::clone(&shared), token.clone());
+        options.bind = Some(format!("{ip}:{port}"));
+        let Ok(handle) = start_server(options) else {
+            return; // Host advertised an IP it will not let us bind; skip.
+        };
+        // Primary bound the explicit non-loopback address ...
+        assert_eq!(handle.http_address.map(|a| a.port()), Some(port));
+        assert!(!handle.http_address.unwrap().ip().is_loopback());
+        // ... and the automatic loopback alias serves the SAME port.
+        let loop_addr = handle.loopback_address.expect("loopback alias bound");
+        assert!(loop_addr.ip().is_loopback());
+        assert_eq!(loop_addr.port(), port);
+        // Both endpoints actually serve the authenticated snapshot.
+        assert!(
+            raw_http(
+                handle.http_address.unwrap(),
+                Some(&token),
+                "GET",
+                "/snapshot"
+            )
+            .contains("hi")
+        );
+        assert!(raw_http(loop_addr, Some(&token), "GET", "/snapshot").contains("hi"));
+    }
+
+    #[test]
+    fn disable_default_loopback_skips_the_alias() {
+        let Some(ip) = discover_nonloopback_ipv4() else {
+            return;
+        };
+        let port = free_port();
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(State::default(), store));
+        let token = "x".repeat(64);
+        let mut options = ServerOptions::new(Arc::clone(&shared), token);
+        options.bind = Some(format!("{ip}:{port}"));
+        options.disable_default_loopback = true;
+        let Ok(handle) = start_server(options) else {
+            return;
+        };
+        assert!(handle.http_address.is_some());
+        assert!(handle.loopback_address.is_none());
     }
 }
