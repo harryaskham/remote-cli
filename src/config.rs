@@ -62,6 +62,12 @@ pub struct DaemonConfig {
     pub unix_socket: Option<PathBuf>,
     pub token_file: Option<PathBuf>,
     pub min_refresh_secs: u64,
+    /// Opt out of the automatic loopback alias that otherwise accompanies a
+    /// specific non-loopback `bind` (e.g. a Tailscale IP). When false (the
+    /// default), a non-loopback bind also serves `127.0.0.1` on the same port
+    /// so local clients keep working without exposing the wildcard LAN.
+    /// Consumers map this onto `ServerOptions::disable_default_loopback`.
+    pub disable_default_loopback: bool,
 }
 
 impl Default for DaemonConfig {
@@ -71,6 +77,7 @@ impl Default for DaemonConfig {
             unix_socket: None,
             token_file: None,
             min_refresh_secs: 2,
+            disable_default_loopback: false,
         }
     }
 }
