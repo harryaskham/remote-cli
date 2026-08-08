@@ -71,4 +71,14 @@ nix-darwin, and Nix-on-Droid modules for a host binary conforming to:
 ```
 
 This keeps package-specific modules declarative while preserving one canonical
-restart, token, cache, and path contract.
+restart, token, cache, and path contract. Every generated service also exposes:
+
+```nix
+services.<app>.preferLocalBinary = true;
+services.<app>.localBinary = null; # defaults at runtime to $HOME/.local/bin/<binary>
+```
+
+When enabled, a runtime launcher uses the executable local update when present
+and executable, otherwise falling back to the immutable Nix package. This is
+compatible with `updatable-cli` without making service evaluation depend on a
+mutable home-directory path.

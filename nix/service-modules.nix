@@ -21,6 +21,16 @@ let
         default = packageFor pkgs;
         description = "${displayName} package whose daemon owns upstream refreshes.";
       };
+      preferLocalBinary = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = "Prefer ~/.local/bin/${binary} at daemon start when it exists and is executable, falling back to the Nix package.";
+      };
+      localBinary = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "Optional local ${binary} path used by preferLocalBinary; null resolves to $HOME/.local/bin/${binary} at daemon start.";
+      };
       bind = lib.mkOption {
         type = lib.types.str;
         default = defaultBind;
@@ -53,9 +63,24 @@ let
       };
     };
 
-  mkArgs = lib: cfg:
+  mkArgs = lib: pkgs: cfg:
+    let
+      launcher = pkgs.writeShellScript "${appName}-daemon-launcher" ''
+        set -euo pipefail
+        ${
+          if cfg.localBinary == null then
+            ''local_bin="$HOME/.local/bin/${binary}"''
+          else
+            ''local_bin=${lib.escapeShellArg cfg.localBinary}''
+        }
+        if [ "${if cfg.preferLocalBinary then "1" else "0"}" = 1 ] && [ -x "$local_bin" ]; then
+          exec "$local_bin" "$@"
+        fi
+        exec ${lib.escapeShellArg (lib.getExe' cfg.package binary)} "$@"
+      '';
+    in
     [
-      "${lib.getExe' cfg.package binary}"
+      "${launcher}"
       "--config"
       cfg.configFile
       "--cache"
@@ -79,7 +104,7 @@ in
     { config, lib, pkgs, ... }:
     let
       cfg = config.services.${appName};
-      args = mkArgs lib cfg;
+      args = mkArgs lib pkgs cfg;
     in
     {
       options.services.${appName} = commonOptions {
@@ -110,7 +135,7 @@ in
       cfg = config.services.${appName};
       primaryUser = config.system.primaryUser or "harryaskham";
       home = config.users.users.${primaryUser}.home or "/Users/${primaryUser}";
-      args = mkArgs lib cfg;
+      args = mkArgs lib pkgs cfg;
     in
     {
       options.services.${appName} = commonOptions {
@@ -137,7 +162,7 @@ in
     { config, lib, pkgs, ... }:
     let
       cfg = config.services.${appName};
-      args = mkArgs lib cfg;
+      args = mkArgs lib pkgs cfg;
     in
     {
       options.services.${appName} = (commonOptions {
