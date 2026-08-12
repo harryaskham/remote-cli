@@ -18,7 +18,9 @@ parts:
 - bounded reconnect backoff and SSE safety limits;
 - source health reporting;
 - one-owner fallback lease, stale lease recovery, and immediate daemon recovery;
-- secure random bearer-token creation and permission checks.
+- secure random bearer-token creation and permission checks; token paths expand
+  a leading `~`, and SOPS-managed token symlinks are read without replacement
+  (including a hard failure rather than token creation for dangling links).
 
 ## Host contract
 
