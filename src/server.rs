@@ -15,6 +15,7 @@ use crate::snapshot::{Snapshot, unix_now};
 
 const HTTP_READ_LIMIT: usize = 16 * 1024;
 const SSE_KEEPALIVE_SECS: u64 = 15;
+const SSE_DATA_FRAGMENT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ProjectedResponse {
@@ -672,8 +673,25 @@ fn serve_sse<S: Snapshot, T: Write>(
         revision = snapshot.revision();
         drop(guard);
         let data = serde_json::to_string(&snapshot).context("serialize SSE snapshot")?;
-        write!(stream, "id: {revision}\nevent: snapshot\ndata: {data}\n\n")?;
+        write!(stream, "id: {revision}\nevent: snapshot\n")?;
+        write_sse_data(&mut stream, &data)?;
+        stream.write_all(b"\n")?;
         stream.flush()?;
+    }
+    Ok(())
+}
+
+fn write_sse_data(stream: &mut impl Write, data: &str) -> Result<()> {
+    let mut start = 0;
+    while start < data.len() {
+        let mut end = (start + SSE_DATA_FRAGMENT_BYTES).min(data.len());
+        while !data.is_char_boundary(end) {
+            end -= 1;
+        }
+        stream.write_all(b"data:")?;
+        stream.write_all(&data.as_bytes()[start..end])?;
+        stream.write_all(b"\n")?;
+        start = end;
     }
     Ok(())
 }

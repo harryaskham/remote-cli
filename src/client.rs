@@ -726,10 +726,10 @@ fn follow_sse<S: Snapshot, R: BufRead>(
         if trimmed.starts_with(':') {
             let _ = tx.send(SourceEvent::DaemonHeartbeat);
         } else if let Some(fragment) = trimmed.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(fragment.trim_start());
+            // This private protocol concatenates bounded fragments exactly.
+            // The server emits no separator bytes, so JSON strings may cross
+            // fragment boundaries without introducing invalid newlines.
+            data.push_str(fragment);
         } else if trimmed.is_empty() && !data.is_empty() {
             let state: S = serde_json::from_str(&data).context("decode daemon event")?;
             tx.send(SourceEvent::State(Box::new(state), Source::Daemon))?;
@@ -971,6 +971,43 @@ mod tests {
         }
         assert!(live);
         assert_eq!(client_store.load().unwrap().value, "live");
+    }
+
+    #[test]
+    fn remote_sse_reassembles_snapshot_larger_than_line_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let value = "é".repeat(MAX_SSE_LINE_BYTES / 2 + 1024);
+        let shared = Arc::new(SharedSnapshot::new(
+            State {
+                revision: 1,
+                value: value.clone(),
+                ..State::default()
+            },
+            CacheStore::new(dir.path().join("server.json")),
+        ));
+        let token_path = dir.path().join("token");
+        let token = crate::load_or_create_token(&token_path).unwrap();
+        let handle = start_server(ServerOptions::new(Arc::clone(&shared), token)).unwrap();
+        let subscription = ClientSubscription::spawn(ClientOptions {
+            cache_store: CacheStore::<State>::new(dir.path().join("client.json")),
+            use_cache: false,
+            use_daemon: true,
+            endpoint: format!("http://{}", handle.http_address.unwrap()),
+            token_path,
+            fallback: false,
+            fallback_timeout: Duration::from_secs(30),
+            fallback_lease_path: dir.path().join("fallback.lock"),
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if matches!(
+                subscription.rx.recv_timeout(Duration::from_millis(500)),
+                Ok(ClientUpdate::State(state, _)) if state.value == value
+            ) {
+                return;
+            }
+        }
+        panic!("large fragmented SSE snapshot was not delivered");
     }
 
     #[cfg(unix)]
