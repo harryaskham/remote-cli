@@ -525,7 +525,7 @@ pub fn fetch_json<T: DeserializeOwned>(endpoint: &str, token_path: &Path, path: 
     match endpoint {
         Endpoint::Http(base) => Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(45))
+            .timeout(None)
             .build()?
             .get(format!("{base}{path}"))
             .header(AUTHORIZATION, format!("Bearer {token}"))
@@ -637,7 +637,9 @@ fn remote_http_session<S: Snapshot>(
 ) -> Result<()> {
     let snapshot_client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(45))
+        // Snapshot size is intentionally unbounded. A total request timeout
+        // turns available bandwidth into an accidental cache-size ceiling.
+        .timeout(None)
         .build()?;
     let event_client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
