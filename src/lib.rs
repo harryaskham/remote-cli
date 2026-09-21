@@ -21,7 +21,7 @@ pub use client::{
     ClientHealth, ClientOptions, ClientSubscription, ClientUpdate, FallbackLease, fetch_json,
     post_json, request_refresh,
 };
-pub use config::{ClientConfig, DaemonConfig};
+pub use config::{ClientConfig, DaemonConfig, HttpLimits};
 pub use endpoint::Endpoint;
 pub use logs::{DaemonLogOptions, LogStream, show_daemon_logs};
 pub use server::{

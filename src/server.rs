@@ -11,9 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 
 use crate::cache::CacheStore;
+use crate::config::HttpLimits;
 use crate::snapshot::{Snapshot, unix_now};
-
-const HTTP_READ_LIMIT: usize = 16 * 1024;
 const SSE_KEEPALIVE_SECS: u64 = 15;
 const SSE_DATA_FRAGMENT_BYTES: usize = 1024 * 1024;
 
@@ -139,6 +138,9 @@ pub struct ServerOptions<S: Snapshot> {
     /// Optional owner-local Unix socket served with the same HTTP/SSE contract.
     pub unix_socket: Option<PathBuf>,
     pub token: String,
+    /// Separate header/body bounds. Defaults to 16 KiB headers and 1 MiB body.
+    /// Forward `DaemonConfig::http_limits` here when using the shared config.
+    pub http_limits: HttpLimits,
     pub projector: Option<SnapshotProjector<S>>,
     pub refresh_validator: RefreshValidator<S>,
     pub health_projector: Option<HealthProjector<S>>,
@@ -161,6 +163,7 @@ impl<S: Snapshot> ServerOptions<S> {
             bind: Some("127.0.0.1:0".into()),
             unix_socket: None,
             token,
+            http_limits: HttpLimits::default(),
             projector: None,
             refresh_validator: Arc::new(|_, domain| !domain.is_empty()),
             health_projector: None,
@@ -195,6 +198,7 @@ impl Drop for ServerHandle {
 }
 
 pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHandle> {
+    options.http_limits.validate()?;
     if options.token.len() < 32 {
         bail!("daemon bearer token is empty or too short");
     }
@@ -415,7 +419,10 @@ where
     S: Snapshot,
     T: Read + Write,
 {
-    let request = read_http_request(&mut stream)?;
+    let (mut request, content_length) = match read_http_headers(&mut stream, options.http_limits) {
+        Ok(request) => request,
+        Err(error) => return write_request_error(&mut stream, &error),
+    };
     if !authorized(&request.headers, &options.token) {
         return write_http_response(
             &mut stream,
@@ -423,6 +430,12 @@ where
             "text/plain",
             b"unauthorized\n",
         );
+    }
+    // Authenticate before waiting for the rest of a potentially large body.
+    // Header reads can include a small prefetched body prefix, but unauthenticated
+    // clients never force a full-body allocation or a wait for that payload.
+    if let Err(error) = read_http_body(&mut stream, &mut request.body, content_length) {
+        return write_request_error(&mut stream, &error);
     }
     let route = request.path.split('?').next().unwrap_or_default();
     match (request.method.as_str(), route) {
@@ -539,24 +552,58 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
-fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest> {
+#[derive(Debug)]
+enum RequestLimit {
+    Headers,
+    Body,
+}
+impl std::fmt::Display for RequestLimit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Headers => "HTTP request headers exceed the configured limit",
+            Self::Body => "HTTP request body exceeds the configured limit",
+        })
+    }
+}
+impl std::error::Error for RequestLimit {}
+
+fn write_request_error(stream: &mut impl Write, error: &anyhow::Error) -> Result<()> {
+    let (status, message): (&str, &[u8]) = match error.downcast_ref::<RequestLimit>() {
+        Some(RequestLimit::Headers) => (
+            "431 Request Header Fields Too Large",
+            b"request headers too large\n",
+        ),
+        Some(RequestLimit::Body) => ("413 Payload Too Large", b"request body too large\n"),
+        None => ("400 Bad Request", b"invalid HTTP request\n"),
+    };
+    // Never reflect a header value, credential or body fragment in a parse error.
+    write_http_response(stream, status, "text/plain", message)
+}
+
+fn read_http_headers(stream: &mut impl Read, limits: HttpLimits) -> Result<(HttpRequest, usize)> {
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 1024];
-    let header_end = loop {
-        if bytes.len() >= HTTP_READ_LIMIT {
-            bail!("HTTP request exceeds {HTTP_READ_LIMIT} bytes");
+    let body_start = loop {
+        let remaining = limits.max_header_bytes.saturating_sub(bytes.len());
+        if remaining == 0 {
+            return Err(RequestLimit::Headers.into());
         }
-        let read = stream.read(&mut chunk)?;
+        let amount = remaining.min(chunk.len());
+        let read = stream.read(&mut chunk[..amount])?;
         if read == 0 {
             bail!("HTTP request ended before headers");
         }
+        let search_start = bytes.len().saturating_sub(3);
         bytes.extend_from_slice(&chunk[..read]);
-        if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position;
+        if let Some(position) = bytes[search_start..]
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+        {
+            break search_start + position + 4;
         }
     };
-    let header_bytes = &bytes[..header_end];
-    let text = std::str::from_utf8(header_bytes).context("HTTP request is not UTF-8")?;
+    let text =
+        std::str::from_utf8(&bytes[..body_start - 4]).context("HTTP headers are not UTF-8")?;
     let mut lines = text.split("\r\n");
     let request_line = lines.next().context("missing HTTP request line")?;
     let mut parts = request_line.split_whitespace();
@@ -565,34 +612,57 @@ fn read_http_request(stream: &mut impl Read) -> Result<HttpRequest> {
         bail!("only GET and POST are supported");
     }
     let path = parts.next().context("missing HTTP path")?.to_string();
-    let headers: BTreeMap<String, String> = lines
-        .take_while(|line| !line.is_empty())
-        .filter_map(|line| line.split_once(':'))
-        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
-        .collect();
-    let content_length = headers
-        .get("content-length")
-        .map_or(Ok(0_usize), |value| value.parse::<usize>())
-        .context("invalid Content-Length")?;
-    let body_start = header_end + 4;
-    let request_length = body_start.saturating_add(content_length);
-    if request_length > HTTP_READ_LIMIT {
-        bail!("HTTP request exceeds {HTTP_READ_LIMIT} bytes");
+    let mut headers = BTreeMap::new();
+    for line in lines {
+        let (name, value) = line.split_once(':').context("malformed HTTP header")?;
+        let name = name.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            bail!("empty HTTP header name");
+        }
+        // Ambiguous framing cannot safely share a transport limit with a proxy.
+        if name == "transfer-encoding" {
+            bail!("Transfer-Encoding is unsupported; send Content-Length");
+        }
+        let duplicate = headers
+            .insert(name.clone(), value.trim().to_string())
+            .is_some();
+        if duplicate && name == "content-length" {
+            bail!("duplicate Content-Length");
+        }
     }
-    while bytes.len() < request_length {
-        let read = stream.read(&mut chunk)?;
+    let content_length = headers.get("content-length").map_or(Ok(0_usize), |value| {
+        if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+            bail!("invalid Content-Length");
+        }
+        value.parse::<usize>().context("invalid Content-Length")
+    })?;
+    if content_length > limits.max_body_bytes {
+        return Err(RequestLimit::Body.into());
+    }
+    let mut body = bytes.split_off(body_start);
+    body.truncate(content_length);
+    Ok((
+        HttpRequest {
+            method,
+            path,
+            headers,
+            body,
+        },
+        content_length,
+    ))
+}
+
+fn read_http_body(stream: &mut impl Read, body: &mut Vec<u8>, content_length: usize) -> Result<()> {
+    let mut chunk = [0_u8; 8192];
+    while body.len() < content_length {
+        let amount = (content_length - body.len()).min(chunk.len());
+        let read = stream.read(&mut chunk[..amount])?;
         if read == 0 {
             bail!("HTTP request body ended early");
         }
-        bytes.extend_from_slice(&chunk[..read]);
+        body.extend_from_slice(&chunk[..read]);
     }
-    let body = bytes[body_start..request_length].to_vec();
-    Ok(HttpRequest {
-        method,
-        path,
-        headers,
-        body,
-    })
+    Ok(())
 }
 
 fn authorized(headers: &BTreeMap<String, String>, expected: &str) -> bool {
@@ -871,6 +941,230 @@ mod tests {
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
+    struct Fragmented {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        fragment: usize,
+    }
+    impl Fragmented {
+        fn new(input: Vec<u8>, fragment: usize) -> Self {
+            Self {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+                fragment,
+            }
+        }
+    }
+    impl Read for Fragmented {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let amount = buffer.len().min(self.fragment);
+            self.input.read(&mut buffer[..amount])
+        }
+    }
+    impl Write for Fragmented {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn header_and_body_boundaries_are_independent_and_fragment_safe() {
+        let body = "UTF-8: 😀 é".repeat(4096).into_bytes();
+        let header = format!(
+            "POST /command HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let limits = HttpLimits {
+            max_header_bytes: header.len(),
+            max_body_bytes: body.len(),
+        };
+        let input = [header.as_bytes(), &body].concat();
+        for fragment in [1, 2, 3, 1024, 65536] {
+            let mut stream = Fragmented::new(input.clone(), fragment);
+            let (mut request, length) = read_http_headers(&mut stream, limits).unwrap();
+            read_http_body(&mut stream, &mut request.body, length).unwrap();
+            assert_eq!(request.body, body);
+        }
+        let mut stream = std::io::Cursor::new(&input);
+        let error = read_http_headers(
+            &mut stream,
+            HttpLimits {
+                max_header_bytes: header.len() - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RequestLimit>(),
+            Some(RequestLimit::Headers)
+        ));
+        let mut stream = std::io::Cursor::new(&input);
+        let error = read_http_headers(
+            &mut stream,
+            HttpLimits {
+                max_body_bytes: body.len() - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<RequestLimit>(),
+            Some(RequestLimit::Body)
+        ));
+        assert_eq!(stream.position(), u64::try_from(header.len()).unwrap());
+    }
+
+    #[test]
+    fn limit_and_framing_rejections_never_invoke_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedSnapshot::new(
+            State::default(),
+            CacheStore::new(dir.path().join("state.json")),
+        ));
+        let token = "a".repeat(64);
+        let mut options = ServerOptions::new(shared, token.clone());
+        options.http_limits = HttpLimits {
+            max_header_bytes: 256,
+            max_body_bytes: 32,
+        };
+        options.command_handler = Some(Arc::new(|_, _| panic!("rejected request invoked command")));
+        let requests = [
+            (
+                format!(
+                    "POST /command HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: 33\r\n\r\n"
+                ),
+                "413",
+            ),
+            (
+                format!(
+                    "GET /health HTTP/1.1\r\nX-Oversized: {}\r\n\r\n",
+                    "x".repeat(256)
+                ),
+                "431",
+            ),
+            (
+                "POST /command HTTP/1.1\r\nContent-Length: 1\r\ncontent-length: 1\r\n\r\nx".into(),
+                "400",
+            ),
+            (
+                "POST /command HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".into(),
+                "400",
+            ),
+            (
+                "POST /command HTTP/1.1\r\nContent-Length: +1\r\n\r\nx".into(),
+                "400",
+            ),
+            // No body follows these valid headers: authentication must reject
+            // immediately, rather than trying to read the announced payload.
+            (
+                "POST /command HTTP/1.1\r\nContent-Length: 32\r\n\r\n".into(),
+                "401",
+            ),
+        ];
+        for (request, status) in requests {
+            let mut stream = Fragmented::new(request.into_bytes(), 1);
+            serve_connection(&mut stream, &options, &AtomicBool::new(false)).unwrap();
+            let response = String::from_utf8(stream.output).unwrap();
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status}")),
+                "{response}"
+            );
+            assert!(!response.contains(&token));
+        }
+    }
+
+    #[test]
+    fn oversized_body_is_rejected_over_http_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedSnapshot::new(
+            State::default(),
+            CacheStore::new(dir.path().join("state.json")),
+        ));
+        let mut options = ServerOptions::new(shared, "x".repeat(64));
+        options.http_limits.max_body_bytes = 8;
+        options.command_handler = Some(Arc::new(|_, _| panic!("oversized command was invoked")));
+        let handle = start_server(options).unwrap();
+        let mut stream = TcpStream::connect(handle.http_address.unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Do not send a body or half-close the socket. A 413 must arrive from
+        // the header alone instead of waiting for payload bytes.
+        stream
+            .write_all(b"POST /command HTTP/1.1\r\nContent-Length: 9\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"));
+    }
+
+    fn large_command_options(dir: &std::path::Path) -> ServerOptions<State> {
+        let shared = Arc::new(SharedSnapshot::new(
+            State::default(),
+            CacheStore::new(dir.join("state.json")),
+        ));
+        let mut options = ServerOptions::new(shared, "c".repeat(64));
+        options.command_handler = Some(Arc::new(|_, input| {
+            Ok(serde_json::json!({"bytes": input.as_str().unwrap().len()}))
+        }));
+        options
+    }
+
+    #[test]
+    fn json_commands_larger_than_16k_and_configured_above_1m_succeed() {
+        for size in [32 * 1024, 1024 * 1024 + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut options = large_command_options(dir.path());
+            if size > 1024 * 1024 {
+                options.http_limits.max_body_bytes = 2 * 1024 * 1024;
+            }
+            let token_path = dir.path().join("token");
+            let token = crate::load_or_create_token(&token_path).unwrap();
+            options.token = token;
+            let handle = start_server(options).unwrap();
+            let reply: serde_json::Value = crate::post_json(
+                &format!("http://{}", handle.http_address.unwrap()),
+                &token_path,
+                "/command",
+                &CommandRequest {
+                    operation: "size".into(),
+                    input: serde_json::Value::String("x".repeat(size)),
+                },
+            )
+            .unwrap();
+            assert_eq!(reply["bytes"], size);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn large_json_commands_use_the_same_limits_over_unix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = large_command_options(dir.path());
+        let socket = dir.path().join("large.sock");
+        options.bind = None;
+        options.unix_socket = Some(socket.clone());
+        let token_path = dir.path().join("token");
+        options.token = crate::load_or_create_token(&token_path).unwrap();
+        let _handle = start_server(options).unwrap();
+        let size = 32 * 1024;
+        let reply: serde_json::Value = crate::post_json(
+            &format!("unix://{}", socket.display()),
+            &token_path,
+            "/command",
+            &CommandRequest {
+                operation: "size".into(),
+                input: serde_json::Value::String("u".repeat(size)),
+            },
+        )
+        .unwrap();
+        assert_eq!(reply["bytes"], size);
     }
 
     /// Discover a routable non-loopback IPv4 for this host without sending any
