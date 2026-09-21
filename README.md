@@ -63,6 +63,49 @@ optional command conduit lets a host keep source credentials, semantic queries,
 and confirmation-gated mutations inside its single persistent daemon rather
 than spawning an upstream client from every CLI/MCP process.
 
+## HTTP request limits
+
+Headers and bodies have **independent configurable bounds**. The old private
+parser's 16 KiB combined request buffer is no longer a ceiling on JSON commands.
+Defaults are **16 KiB headers** (including the request line and final CRLF) and
+**1 MiB body**. Set larger or smaller body limits without weakening header limits:
+
+```rust,ignore
+let mut options = remote_cli::ServerOptions::new(shared, token);
+options.http_limits = remote_cli::HttpLimits {
+    max_header_bytes: 16 * 1024,
+    max_body_bytes: 8 * 1024 * 1024,
+};
+let server = remote_cli::start_server(options)?;
+```
+
+The shared `DaemonConfig` also includes the corresponding YAML/JSON field. Hosts
+using it must forward `config.daemon.http_limits` to `options.http_limits`, just
+as they forward `bind` and `unix_socket`:
+
+```yaml
+daemon:
+  http-limits:
+    max-header-bytes: 16384
+    max-body-bytes: 8388608
+```
+
+The limits count **bytes**, not characters. Header bytes do not reduce the body
+budget. Oversized headers receive HTTP **431**; a `Content-Length` above the body
+limit receives HTTP **413**, without waiting for that body or calling the domain
+handler. Other framing errors receive a redacted HTTP **400**. Duplicate
+`Content-Length` and `Transfer-Encoding` are rejected: send a single
+`Content-Length`, not chunked request encoding. Authentication is checked before
+reading the rest of an admitted body. TCP and Unix sockets use the same parser.
+A zero body limit permits bodyless requests only; invalid/overflowing limits fail
+at server startup, before binding.
+
+These transport limits do not change a host's own input validation, response size,
+SSE limits, scheduling or admission policy. Larger requests remain bounded, and
+hosts should choose limits appropriate for their domain rather than disabling
+bounds entirely. `post_json` already sends length-delimited JSON and needs no
+special client option for larger bodies.
+
 ## Nix service mixin
 
 The flake exports `lib.mkDaemonModules`, which generates matching NixOS,

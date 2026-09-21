@@ -1,0 +1,27 @@
+{
+  "scope": "Configurable, separate HTTP header and JSON body limits",
+  "requirements": [
+    {
+      "id": "HTTP-LIMIT-01",
+      "contract": "16 KiB headers and 1 MiB bodies by default; serde/schemars config and server options expose both bounds independently",
+      "evidence": ["src/config.rs::tests::http_limits_default_independently_and_round_trip", "src/config.rs::tests::limits_validate_arithmetic_and_allow_bodyless_services"]
+    },
+    {
+      "id": "HTTP-LIMIT-02",
+      "contract": "Exact byte boundaries, including fragmented UTF-8 bodies and split header delimiters, preserve the full payload",
+      "evidence": ["src/server.rs::tests::header_and_body_boundaries_are_independent_and_fragment_safe"]
+    },
+    {
+      "id": "HTTP-LIMIT-03",
+      "contract": "Oversize headers/bodies produce 431/413 without invoking the handler; unauthenticated callers cannot force the rest of a body read; ambiguous framing is rejected",
+      "evidence": ["src/server.rs::tests::limit_and_framing_rejections_never_invoke_commands", "src/server.rs::tests::oversized_body_is_rejected_over_http_without_reading_it"]
+    },
+    {
+      "id": "HTTP-LIMIT-04",
+      "contract": "Actual post_json calls above 16 KiB, and above 1 MiB when explicitly configured, work through the real HTTP/Unix command conduit",
+      "evidence": ["src/server.rs::tests::json_commands_larger_than_16k_and_configured_above_1m_succeed", "src/server.rs::tests::large_json_commands_use_the_same_limits_over_unix"]
+    }
+  ],
+  "validation": ["cargo fmt --check", "cargo test --locked", "cargo clippy --locked --all-targets --all-features -- -D warnings"],
+  "isolation": "Ephemeral TCP listeners, per-test Unix sockets, temporary private fixture tokens/cache, in-memory fragmented readers; no production account or daemon"
+}
