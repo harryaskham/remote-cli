@@ -53,6 +53,8 @@ pub struct SharedSnapshot<S: Snapshot> {
     pub(crate) state: Mutex<S>,
     pub(crate) changed: Condvar,
     store: CacheStore<S>,
+    /// Serialize commits without holding the snapshot/read lock during I/O.
+    persisted_revision: Mutex<Option<u64>>,
     refresh_requests: Mutex<VecDeque<String>>,
 }
 
@@ -63,6 +65,7 @@ impl<S: Snapshot> SharedSnapshot<S> {
             state: Mutex::new(state),
             changed: Condvar::new(),
             store,
+            persisted_revision: Mutex::new(None),
             refresh_requests: Mutex::new(VecDeque::new()),
         }
     }
@@ -93,7 +96,7 @@ impl<S: Snapshot> SharedSnapshot<S> {
     }
 
     pub fn update(&self, mutate: impl FnOnce(&mut S)) {
-        let snapshot = {
+        {
             let mut state = self
                 .state
                 .lock()
@@ -102,18 +105,15 @@ impl<S: Snapshot> SharedSnapshot<S> {
             let revision = state.revision().saturating_add(1);
             state.set_revision(revision);
             state.set_saved_at(Some(unix_now()));
-            state.clone()
-        };
-        if let Err(error) = self.store.save(&snapshot) {
-            eprintln!("{} daemon: cache save failed: {error:#}", S::APP_NAME);
         }
         self.changed.notify_all();
+        self.persist_latest();
     }
 
     /// Replace a collector-owned payload while allowing a host to preserve
     /// health/notices that changed during an unlocked API request.
     pub fn replace_payload(&self, mut state: S, reconcile: impl FnOnce(&mut S, &S)) {
-        let snapshot = {
+        {
             let mut current = self
                 .state
                 .lock()
@@ -121,13 +121,27 @@ impl<S: Snapshot> SharedSnapshot<S> {
             reconcile(&mut state, &current);
             state.set_revision(current.revision().saturating_add(1));
             state.set_saved_at(Some(unix_now()));
-            *current = state.clone();
-            state
-        };
-        if let Err(error) = self.store.save(&snapshot) {
-            eprintln!("{} daemon: cache save failed: {error:#}", S::APP_NAME);
+            *current = state;
         }
         self.changed.notify_all();
+        self.persist_latest();
+    }
+
+    fn persist_latest(&self) {
+        let mut persisted = self
+            .persisted_revision
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Snapshot AFTER acquiring the commit lock. An older caller arriving
+        // late must never roll durable state back over a newer revision.
+        let snapshot = self.snapshot();
+        if persisted.is_some_and(|revision| revision >= snapshot.revision()) {
+            return;
+        }
+        match self.store.save_exact(&snapshot) {
+            Ok(()) => *persisted = Some(snapshot.revision()),
+            Err(error) => eprintln!("{} daemon: cache save failed: {error:#}", S::APP_NAME),
+        }
     }
 }
 
@@ -911,6 +925,98 @@ mod tests {
         shared.update(|state| state.value = "new".into());
         assert_eq!(shared.snapshot().revision, 1);
         assert_eq!(store.load().unwrap().value, "new");
+    }
+
+    #[test]
+    fn concurrent_cache_saves_are_atomic_private_and_clean_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        store.save_exact(&State::default()).unwrap();
+        let barrier = std::sync::Barrier::new(8);
+        thread::scope(|scope| {
+            for writer in 0..8 {
+                let store = &store;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for revision in 1..=16 {
+                        let value = writer.to_string().repeat(64 * 1024);
+                        store
+                            .save_exact(&State {
+                                revision,
+                                value,
+                                ..State::default()
+                            })
+                            .unwrap();
+                        // Another writer may have won, but every observed JSON
+                        // document must be complete and internally consistent.
+                        let saved = store.load().unwrap();
+                        assert_eq!(saved.value.len(), 64 * 1024);
+                        assert!(
+                            saved
+                                .value
+                                .bytes()
+                                .all(|byte| byte == saved.value.as_bytes()[0])
+                        );
+                    }
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(store.path()).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        // Failed replacement also cleans up the exclusively owned temp file.
+        let blocked = dir.path().join("directory");
+        fs::create_dir(&blocked).unwrap();
+        assert!(CacheStore::new(blocked).save(&State::default()).is_err());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn concurrent_shared_writers_persist_latest_revision_without_blocking_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = SharedSnapshot::new(State::default(), store.clone());
+        // Hold disk commits back while two independent state writers advance.
+        // Readers must remain usable, and delayed commits must use the winner.
+        let commit_guard = shared.persisted_revision.lock().unwrap();
+        thread::scope(|scope| {
+            scope.spawn(|| shared.update(|state| state.value = "first".into()));
+            scope.spawn(|| {
+                shared.replace_payload(State::default(), |state, current| {
+                    state.value.clone_from(&current.value);
+                });
+            });
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while shared.snapshot().revision < 2 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "read/state lock blocked by persistence"
+                );
+                thread::yield_now();
+            }
+            drop(commit_guard);
+        });
+        assert_eq!(store.load().unwrap().revision, shared.snapshot().revision);
+        assert_eq!(store.load().unwrap().value, shared.snapshot().value);
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..16 {
+                        shared.update(|state| state.value.push('x'));
+                    }
+                });
+            }
+        });
+        assert_eq!(store.load().unwrap().revision, 130);
+        assert_eq!(store.load().unwrap().value, shared.snapshot().value);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

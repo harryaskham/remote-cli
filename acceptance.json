@@ -1,6 +1,16 @@
 {
-  "scope": "Configurable, separate HTTP header and JSON body limits",
+  "scope": "Configurable HTTP limits and concurrent atomic persistence",
   "requirements": [
+    {
+      "id": "CACHE-ATOMIC-01",
+      "contract": "Concurrent writers own unique 0600 temporary files; readers always see complete JSON; failed replacements leave no temporary files",
+      "evidence": ["src/server.rs::tests::concurrent_cache_saves_are_atomic_private_and_clean_up"]
+    },
+    {
+      "id": "CACHE-ORDER-01",
+      "contract": "Collector and reconnect commits cannot roll back durable revisions; readers and state mutations progress while disk commits wait",
+      "evidence": ["src/server.rs::tests::concurrent_shared_writers_persist_latest_revision_without_blocking_readers"]
+    },
     {
       "id": "HTTP-LIMIT-01",
       "contract": "16 KiB headers and 1 MiB bodies by default; serde/schemars config and server options expose both bounds independently",

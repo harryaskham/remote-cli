@@ -63,6 +63,22 @@ optional command conduit lets a host keep source credentials, semantic queries,
 and confirmation-gated mutations inside its single persistent daemon rather
 than spawning an upstream client from every CLI/MCP process.
 
+## Concurrent persistence
+
+Each `CacheStore` write uses an exclusive, owner-only temporary file in the same
+folder, streams compact JSON through a buffer, syncs the file, and atomically
+replaces the destination. Concurrent writers cannot truncate or rename one
+another's temporary files. Failed writes clean up their private temporary file.
+The JSON schema is unchanged and older pretty-printed snapshots still load.
+
+`SharedSnapshot` additionally serializes durable commits and snapshots the latest
+revision **after** obtaining the commit lock. A delayed collector/reconnect thread
+cannot overwrite a newer committed revision; redundant pending commits coalesce.
+Snapshot readers and state mutations never hold the filesystem commit lock, and
+persistence preserves the authoritative revision timestamp. Independent stores
+remain independent. Plain `CacheStore` replacement is atomic, not a substitute
+for `SharedSnapshot`'s single-authority revision ordering.
+
 ## HTTP request limits
 
 Headers and bodies have **independent configurable bounds**. The old private

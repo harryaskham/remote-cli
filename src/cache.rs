@@ -1,5 +1,5 @@
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
+use std::io::{BufWriter, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
@@ -84,39 +84,30 @@ impl<S: Snapshot> CacheStore<S> {
         if stamp_now {
             snapshot.set_saved_at(Some(unix_now()));
         }
-        let bytes = serde_json::to_vec_pretty(&snapshot)
-            .with_context(|| format!("serialize {} cache", S::DISPLAY_NAME))?;
-        let temporary = self
-            .path
-            .with_extension(format!("json.{}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.create(true).truncate(true).write(true);
-        #[cfg(unix)]
+        // A PID alone is not unique: collector, reconnect and client threads
+        // can save concurrently. Each writer owns an exclusive 0600 file in the
+        // destination directory; RAII removes it on every error path.
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".remote-cli-cache-")
+            .tempfile_in(parent)
+            .context("create private temporary cache")?;
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            // Stream compact JSON rather than allocating another cache-sized
+            // pretty-printed buffer while the full snapshot is live.
+            let mut writer = BufWriter::new(temporary.as_file_mut());
+            serde_json::to_writer(&mut writer, &snapshot)
+                .with_context(|| format!("serialize {} cache", S::DISPLAY_NAME))?;
+            writer.flush().context("flush temporary cache")?;
         }
-        let mut file = options.open(&temporary).with_context(|| {
+        temporary
+            .as_file()
+            .sync_all()
+            .context("sync temporary cache")?;
+        temporary.persist(&self.path).with_context(|| {
             format!(
-                "create temporary {} cache {}",
+                "atomically replace {} cache {}",
                 S::DISPLAY_NAME,
-                temporary.display()
-            )
-        })?;
-        file.write_all(&bytes).with_context(|| {
-            format!(
-                "write temporary {} cache {}",
-                S::DISPLAY_NAME,
-                temporary.display()
-            )
-        })?;
-        file.sync_all().context("sync temporary cache")?;
-        fs::rename(&temporary, &self.path).with_context(|| {
-            format!(
-                "atomically replace {} cache {} with {}",
-                S::DISPLAY_NAME,
-                self.path.display(),
-                temporary.display()
+                self.path.display()
             )
         })?;
         Ok(())
