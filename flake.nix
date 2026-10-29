@@ -10,7 +10,7 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = nixpkgs.legacyPackages.${system};
         remoteCli = pkgs.rustPlatform.buildRustPackage {
           pname = "remote-cli";
           version = "0.1.0";
