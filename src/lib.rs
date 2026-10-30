@@ -9,6 +9,7 @@
 pub mod auth;
 pub mod cache;
 pub mod client;
+pub mod command;
 pub mod config;
 pub mod endpoint;
 pub mod logs;
@@ -21,6 +22,7 @@ pub use client::{
     ClientHealth, ClientOptions, ClientSubscription, ClientUpdate, FallbackLease, fetch_json,
     post_json, request_refresh,
 };
+pub use command::{CommandError, command};
 pub use config::{ClientConfig, DaemonConfig, HttpLimits};
 pub use endpoint::Endpoint;
 pub use logs::{DaemonLogOptions, LogStream, show_daemon_logs};
