@@ -1,9 +1,9 @@
 name: release
 
 # Triggered ONLY on a pushed version tag (v*) from `scripts/release.sh` (or
-# `nix run .#release`). Runs on remote-cli's repo-scoped persistent NixOS
-# runners ([self-hosted, nix, x86_64-linux]) rather than the azure-ephemeral
-# pool, which has no runners registered against this repo (bd-26bdac). Nix +
+# `nix run .#release`). Runs on GitHub-hosted ubuntu-latest with
+# Determinate Nix (public repository: free minutes, and fleet runners never
+# serve public repositories). Nix +
 # flakes provide all toolchains (including `gh`, via `nix run nixpkgs#gh`). The
 # only dependency (mcp-cli) is PUBLIC over HTTPS, so no SSH key/secret is needed.
 #
@@ -35,7 +35,7 @@ permissions:
 jobs:
   resolve:
     name: resolve release context
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.ctx.outputs.tag }}
@@ -52,12 +52,13 @@ jobs:
   test:
     name: test suite
     needs: resolve
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@v3
       - name: Run the full suite
         shell: bash
         run: |
@@ -69,12 +70,13 @@ jobs:
     needs:
       - resolve
       - test
-    runs-on: [self-hosted, nix, x86_64-linux]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: DeterminateSystems/determinate-nix-action@v3
 
       - name: Create or update the GitHub Release
         shell: bash
