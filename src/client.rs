@@ -646,7 +646,7 @@ fn remote_http_session<S: Snapshot>(
         .timeout(None)
         .build()?;
     let authorization = format!("Bearer {token}");
-    let initial: S = snapshot_client
+    let value: serde_json::Value = snapshot_client
         .get(format!("{base}/snapshot"))
         .header(AUTHORIZATION, &authorization)
         .header(ACCEPT, "application/json")
@@ -656,17 +656,18 @@ fn remote_http_session<S: Snapshot>(
         .context("daemon snapshot rejected")?
         .json()
         .context("decode daemon snapshot")?;
+    let initial = S::deserialize(&value).context("decode daemon snapshot")?;
     tx.send(SourceEvent::DaemonUp)?;
     tx.send(SourceEvent::State(Box::new(initial), Source::Daemon))?;
     let response = event_client
-        .get(format!("{base}/events"))
+        .get(format!("{base}/events?patch=1"))
         .header(AUTHORIZATION, authorization)
         .header(ACCEPT, "text/event-stream")
         .send()
         .context("connect daemon events")?
         .error_for_status()
         .context("daemon event stream rejected")?;
-    follow_sse(BufReader::new(response), false, tx, stop)
+    follow_sse(BufReader::new(response), false, tx, stop, value)
 }
 
 #[cfg(unix)]
@@ -679,7 +680,9 @@ fn remote_unix_session<S: Snapshot>(
     use std::os::unix::net::UnixStream;
     let response = unix_request(socket, "GET", "/snapshot", token, &[])?;
     let body = ensure_http_success(&response, "daemon snapshot rejected")?;
-    let initial: S = serde_json::from_slice(body).context("decode daemon snapshot")?;
+    let value: serde_json::Value =
+        serde_json::from_slice(body).context("decode daemon snapshot")?;
+    let initial = S::deserialize(&value).context("decode daemon snapshot")?;
     tx.send(SourceEvent::DaemonUp)?;
     tx.send(SourceEvent::State(Box::new(initial), Source::Daemon))?;
 
@@ -687,17 +690,21 @@ fn remote_unix_session<S: Snapshot>(
         .with_context(|| format!("connect daemon Unix socket {}", socket.display()))?;
     write!(
         stream,
-        "GET /events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nAuthorization: Bearer {token}\r\n\r\n"
+        "GET /events?patch=1 HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nAuthorization: Bearer {token}\r\n\r\n"
     )?;
     stream.flush()?;
-    follow_sse(BufReader::new(stream), true, tx, stop)
+    follow_sse(BufReader::new(stream), true, tx, stop, value)
 }
 
+/// Follow `/events`: full snapshots (`event: snapshot`, and every event from a
+/// daemon that predates patches) replace `state`; merge patches
+/// (`event: patch`) update it.
 fn follow_sse<S: Snapshot, R: BufRead>(
     mut reader: R,
     skip_http_headers: bool,
     tx: &Sender<SourceEvent<S>>,
     stop: &AtomicBool,
+    mut state: serde_json::Value,
 ) -> Result<()> {
     let mut line = String::new();
     if skip_http_headers {
@@ -715,6 +722,7 @@ fn follow_sse<S: Snapshot, R: BufRead>(
         }
     }
     let mut data = String::new();
+    let mut event = String::new();
     while !stop.load(Ordering::Acquire) {
         line.clear();
         let read = reader.read_line(&mut line).context("read daemon event")?;
@@ -727,15 +735,25 @@ fn follow_sse<S: Snapshot, R: BufRead>(
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.starts_with(':') {
             let _ = tx.send(SourceEvent::DaemonHeartbeat);
+        } else if let Some(name) = trimmed.strip_prefix("event:") {
+            event = name.trim().to_string();
         } else if let Some(fragment) = trimmed.strip_prefix("data:") {
             // This private protocol concatenates bounded fragments exactly.
             // The server emits no separator bytes, so JSON strings may cross
             // fragment boundaries without introducing invalid newlines.
             data.push_str(fragment);
         } else if trimmed.is_empty() && !data.is_empty() {
-            let state: S = serde_json::from_str(&data).context("decode daemon event")?;
-            tx.send(SourceEvent::State(Box::new(state), Source::Daemon))?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&data).context("decode daemon event")?;
+            if event == "patch" {
+                crate::patch::apply(&mut state, &payload);
+            } else {
+                state = payload;
+            }
+            let snapshot = S::deserialize(&state).context("decode daemon event")?;
+            tx.send(SourceEvent::State(Box::new(snapshot), Source::Daemon))?;
             data.clear();
+            event.clear();
         }
     }
     Ok(())
@@ -973,6 +991,91 @@ mod tests {
         }
         assert!(live);
         assert_eq!(client_store.load().unwrap().value, "live");
+    }
+
+    #[test]
+    fn remote_sse_sends_patches_after_the_first_snapshot_and_reproduces_state() {
+        use std::io::{BufRead as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedSnapshot::new(
+            State {
+                value: "initial".into(),
+                saved_at: Some(5),
+                ..State::default()
+            },
+            CacheStore::new(dir.path().join("server.json")),
+        ));
+        let token_path = dir.path().join("token");
+        let token = crate::load_or_create_token(&token_path).unwrap();
+        let handle = start_server(ServerOptions::new(Arc::clone(&shared), token.clone())).unwrap();
+        let address = handle.http_address.unwrap();
+
+        // On the wire: one full snapshot, then small merge patches.
+        let mut raw = std::net::TcpStream::connect(address).unwrap();
+        write!(
+            raw,
+            "GET /events?patch=1 HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .unwrap();
+        raw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut reader = std::io::BufReader::new(raw);
+        let mut events = Vec::new();
+        let mut line = String::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut updated = false;
+        while events.len() < 2 && Instant::now() < deadline {
+            line.clear();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            if let Some(name) = line.trim_end().strip_prefix("event: ") {
+                events.push(name.to_string());
+                if !updated {
+                    shared.update(|state| state.value = "patched".into());
+                    updated = true;
+                }
+            } else if line.starts_with("data:") && events.len() == 2 {
+                assert!(
+                    line.contains("patched") && !line.contains("initial"),
+                    "{line}"
+                );
+            }
+        }
+        assert_eq!(events, vec!["snapshot", "patch"]);
+
+        // Through the client: patches reproduce the server's state exactly,
+        // including an Option going back to None.
+        let subscription = ClientSubscription::spawn(ClientOptions {
+            cache_store: CacheStore::<State>::new(dir.path().join("client.json")),
+            use_cache: false,
+            use_daemon: true,
+            endpoint: format!("http://{address}"),
+            token_path,
+            fallback: false,
+            fallback_timeout: Duration::from_secs(30),
+            fallback_lease_path: dir.path().join("fallback.lock"),
+        });
+        let wait_for = |want: &str| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if let Ok(ClientUpdate::State(state, _)) =
+                    subscription.rx.recv_timeout(Duration::from_millis(250))
+                {
+                    if state.value == want {
+                        return Some(state);
+                    }
+                }
+            }
+            None
+        };
+        assert!(wait_for("patched").is_some());
+        shared.update(|state| {
+            state.value = "cleared".into();
+            state.saved_at = None;
+        });
+        let state = wait_for("cleared").expect("patched state arrives");
+        assert_eq!(state.saved_at, shared.snapshot().saved_at);
+        assert_eq!(state.revision, shared.snapshot().revision);
     }
 
     #[test]

@@ -499,7 +499,12 @@ where
                 &response.body,
             )
         }
-        ("GET", "/events") => serve_sse(stream, &options.shared, stop),
+        ("GET", "/events") => serve_sse(
+            stream,
+            &options.shared,
+            stop,
+            query_parameter(&request.path, "patch").as_deref() == Some("1"),
+        ),
         ("POST", "/command") => {
             let Some(handler) = &options.command_handler else {
                 return write_http_response(
@@ -725,16 +730,22 @@ fn write_http_response(
     Ok(())
 }
 
+/// Server-sent snapshots. With `patches`, the first event is the full
+/// snapshot (`event: snapshot`) and later ones are JSON merge patches against
+/// the previous event (`event: patch`, see [`crate::patch`]); otherwise every
+/// event is the full snapshot.
 fn serve_sse<S: Snapshot, T: Write>(
     mut stream: T,
     shared: &SharedSnapshot<S>,
     stop: &AtomicBool,
+    patches: bool,
 ) -> Result<()> {
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n"
     )?;
     let mut revision = u64::MAX;
+    let mut sent: Option<serde_json::Value> = None;
     while !stop.load(Ordering::Acquire) {
         let mut guard = shared
             .state
@@ -756,8 +767,31 @@ fn serve_sse<S: Snapshot, T: Write>(
         let snapshot = guard.clone();
         revision = snapshot.revision();
         drop(guard);
-        let data = serde_json::to_string(&snapshot).context("serialize SSE snapshot")?;
-        write!(stream, "id: {revision}\nevent: snapshot\n")?;
+        let (event, data) = if patches {
+            let value = serde_json::to_value(&snapshot).context("serialize SSE snapshot")?;
+            let event = match sent.as_ref() {
+                Some(previous) => (
+                    "patch",
+                    serde_json::to_string(
+                        &crate::patch::diff(previous, &value)
+                            .unwrap_or_else(|| serde_json::json!({})),
+                    )
+                    .context("serialize SSE patch")?,
+                ),
+                None => (
+                    "snapshot",
+                    serde_json::to_string(&value).context("serialize SSE snapshot")?,
+                ),
+            };
+            sent = Some(value);
+            event
+        } else {
+            (
+                "snapshot",
+                serde_json::to_string(&snapshot).context("serialize SSE snapshot")?,
+            )
+        };
+        write!(stream, "id: {revision}\nevent: {event}\n")?;
         write_sse_data(&mut stream, &data)?;
         stream.write_all(b"\n")?;
         stream.flush()?;

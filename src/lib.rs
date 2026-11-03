@@ -13,6 +13,7 @@ pub mod command;
 pub mod config;
 pub mod endpoint;
 pub mod logs;
+pub mod patch;
 pub mod server;
 pub mod snapshot;
 
