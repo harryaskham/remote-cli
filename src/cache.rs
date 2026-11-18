@@ -67,7 +67,17 @@ impl<S: Snapshot> CacheStore<S> {
         self.save_inner(state, false)
     }
 
+    /// [`Self::save_exact`] for a snapshot the caller is done with: spares
+    /// copying it once more.
+    pub fn save_exact_owned(&self, state: S) -> Result<()> {
+        self.write(state, false)
+    }
+
     fn save_inner(&self, state: &S, stamp_now: bool) -> Result<()> {
+        self.write(state.clone(), stamp_now)
+    }
+
+    fn write(&self, mut snapshot: S, stamp_now: bool) -> Result<()> {
         let parent = self
             .path
             .parent()
@@ -79,7 +89,6 @@ impl<S: Snapshot> CacheStore<S> {
                 parent.display()
             )
         })?;
-        let mut snapshot = state.clone();
         snapshot.normalize();
         if stamp_now {
             snapshot.set_saved_at(Some(unix_now()));

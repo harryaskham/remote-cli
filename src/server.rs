@@ -4,9 +4,9 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -56,6 +56,34 @@ pub struct SharedSnapshot<S: Snapshot> {
     /// Serialize commits without holding the snapshot/read lock during I/O.
     persisted_revision: Mutex<Option<u64>>,
     refresh_requests: Mutex<VecDeque<String>>,
+    /// When the cache file is written; see [`Self::coalesce_saves`].
+    saves: Arc<Saves>,
+}
+
+/// The cache file's write schedule, shared with the writer thread.
+#[derive(Default)]
+struct Saves {
+    plan: Mutex<SavePlan>,
+    wake: Condvar,
+}
+
+#[derive(Default)]
+struct SavePlan {
+    /// Zero: every change is written before `update` returns (the default).
+    every: Duration,
+    /// A change is in memory that the file does not have yet.
+    dirty: bool,
+    last_write: Option<Instant>,
+    writer: bool,
+    stop: bool,
+}
+
+impl Saves {
+    fn plan(&self) -> std::sync::MutexGuard<'_, SavePlan> {
+        self.plan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 impl<S: Snapshot> SharedSnapshot<S> {
@@ -67,6 +95,7 @@ impl<S: Snapshot> SharedSnapshot<S> {
             store,
             persisted_revision: Mutex::new(None),
             refresh_requests: Mutex::new(VecDeque::new()),
+            saves: Arc::default(),
         }
     }
 
@@ -76,6 +105,68 @@ impl<S: Snapshot> SharedSnapshot<S> {
             |poisoned| poisoned.into_inner().clone(),
             |state| state.clone(),
         )
+    }
+
+    /// Look at the state in place. [`Self::snapshot`] copies all of it, which
+    /// is wasteful for one field of a large cache; keep `look` short, since
+    /// writers and other readers wait for it.
+    pub fn read<R>(&self, look: impl FnOnce(&S) -> R) -> R {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        look(&state)
+    }
+
+    /// Write the cache file at most once per `every` instead of on each
+    /// change. Memory, and so every reader and stream, is current as before;
+    /// only the file lags, by at most `every`. The first change after a quiet
+    /// spell is written at once; later ones wait for one deadline (the last
+    /// write plus `every`). Nothing runs while nothing changes. [`Self::flush`]
+    /// writes now, and dropping the snapshot writes what is left.
+    ///
+    /// For hosts whose cache is large and changes often: a full rewrite per
+    /// change then costs more than everything else the host does.
+    pub fn coalesce_saves(self: &Arc<Self>, every: Duration) {
+        let spawn = {
+            let mut plan = self.saves.plan();
+            plan.every = every;
+            !every.is_zero() && !std::mem::replace(&mut plan.writer, true)
+        };
+        if spawn {
+            let saves = Arc::clone(&self.saves);
+            let shared = Arc::downgrade(self);
+            let spawned = thread::Builder::new()
+                .name(format!("{}-cache-writer", S::APP_NAME))
+                .spawn(move || write_when_due(&saves, &shared));
+            if spawned.is_err() {
+                // No thread: fall back to writing on each change.
+                let mut plan = self.saves.plan();
+                plan.every = Duration::ZERO;
+                plan.writer = false;
+            }
+        }
+    }
+
+    /// Write the cache file now if memory is ahead of it.
+    pub fn flush(&self) {
+        self.saves.plan().dirty = false;
+        self.persist_latest();
+        self.saves.plan().last_write = Some(Instant::now());
+    }
+
+    /// After a change: write now (the default), or leave it to the writer.
+    fn save_changed(&self) {
+        let mut plan = self.saves.plan();
+        if plan.every.is_zero() {
+            drop(plan);
+            self.persist_latest();
+        } else if !plan.dirty {
+            plan.dirty = true;
+            drop(plan);
+            // Only the first change of a burst wakes the writer.
+            self.saves.wake.notify_one();
+        }
     }
 
     pub fn request_refresh(&self, domain: String) {
@@ -107,7 +198,7 @@ impl<S: Snapshot> SharedSnapshot<S> {
             state.set_saved_at(Some(unix_now()));
         }
         self.changed.notify_all();
-        self.persist_latest();
+        self.save_changed();
     }
 
     /// Replace a collector-owned payload while allowing a host to preserve
@@ -124,7 +215,7 @@ impl<S: Snapshot> SharedSnapshot<S> {
             *current = state;
         }
         self.changed.notify_all();
-        self.persist_latest();
+        self.save_changed();
     }
 
     fn persist_latest(&self) {
@@ -132,16 +223,76 @@ impl<S: Snapshot> SharedSnapshot<S> {
             .persisted_revision
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Nothing new: do not copy the state just to find that out.
+        let current = self.read(Snapshot::revision);
+        if persisted.is_some_and(|revision| revision >= current) {
+            return;
+        }
         // Snapshot AFTER acquiring the commit lock. An older caller arriving
         // late must never roll durable state back over a newer revision.
         let snapshot = self.snapshot();
-        if persisted.is_some_and(|revision| revision >= snapshot.revision()) {
-            return;
-        }
-        match self.store.save_exact(&snapshot) {
-            Ok(()) => *persisted = Some(snapshot.revision()),
+        let revision = snapshot.revision();
+        match self.store.save_exact_owned(snapshot) {
+            Ok(()) => *persisted = Some(revision),
             Err(error) => eprintln!("{} daemon: cache save failed: {error:#}", S::APP_NAME),
         }
+    }
+}
+
+impl<S: Snapshot> Drop for SharedSnapshot<S> {
+    fn drop(&mut self) {
+        let dirty = {
+            let mut plan = self.saves.plan();
+            plan.stop = true;
+            std::mem::take(&mut plan.dirty)
+        };
+        self.saves.wake.notify_all();
+        if dirty {
+            self.persist_latest();
+        }
+    }
+}
+
+/// The writer of [`SharedSnapshot::coalesce_saves`]: parked until a change,
+/// then one wait until the write is due, then the write.
+fn write_when_due<S: Snapshot>(saves: &Saves, shared: &Weak<SharedSnapshot<S>>) {
+    loop {
+        let mut plan = saves.plan();
+        while !plan.dirty && !plan.stop {
+            plan = saves
+                .wake
+                .wait(plan)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        while !plan.stop && plan.dirty {
+            let wait = plan
+                .last_write
+                .map(|at| (at + plan.every).saturating_duration_since(Instant::now()))
+                .filter(|wait| !wait.is_zero());
+            let Some(wait) = wait else {
+                break;
+            };
+            plan = saves
+                .wake
+                .wait_timeout(plan, wait)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        if plan.stop {
+            // Dropping the snapshot writes what is left itself.
+            return;
+        }
+        if !plan.dirty {
+            // Flushed while this waited.
+            continue;
+        }
+        plan.dirty = false;
+        drop(plan);
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        shared.persist_latest();
+        saves.plan().last_write = Some(Instant::now());
     }
 }
 
@@ -959,6 +1110,67 @@ mod tests {
         shared.update(|state| state.value = "new".into());
         assert_eq!(shared.snapshot().revision, 1);
         assert_eq!(store.load().unwrap().value, "new");
+    }
+
+    #[test]
+    fn read_looks_at_the_state_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = SharedSnapshot::new(
+            State::default(),
+            CacheStore::new(dir.path().join("state.json")),
+        );
+        shared.update(|state| state.value = "seen".into());
+        assert_eq!(shared.read(|state| state.value.len()), 4);
+        assert_eq!(shared.read(Snapshot::revision), 1);
+    }
+
+    #[test]
+    fn coalesced_saves_keep_memory_current_and_the_file_at_most_one_interval_behind() {
+        let wait_for = |store: &CacheStore<State>, value: &str| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while store.load().unwrap().value != value {
+                assert!(
+                    Instant::now() < deadline,
+                    "{value:?} never reached the file"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        // A long interval: the first change is written at once, later ones
+        // wait, and flush or drop writes them.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(State::default(), store.clone()));
+        shared.coalesce_saves(Duration::from_secs(3600));
+        shared.update(|state| state.value = "first".into());
+        wait_for(&store, "first");
+        for round in 0..50 {
+            shared.update(|state| state.value = format!("burst {round}"));
+        }
+        assert_eq!(shared.snapshot().value, "burst 49", "memory is current");
+        assert_eq!(shared.snapshot().revision, 51);
+        assert_eq!(store.load().unwrap().value, "first", "the file waits");
+        shared.flush();
+        assert_eq!(store.load().unwrap().value, "burst 49");
+        assert_eq!(store.load().unwrap().revision, 51);
+        shared.update(|state| state.value = "last".into());
+        assert_eq!(store.load().unwrap().value, "burst 49");
+        drop(shared);
+        assert_eq!(store.load().unwrap().value, "last", "dropping writes it");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // A short interval: a burst reaches the file by its deadline with no
+        // further change to push it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(State::default(), store.clone()));
+        shared.coalesce_saves(Duration::from_millis(150));
+        shared.update(|state| state.value = "one".into());
+        wait_for(&store, "one");
+        shared.update(|state| state.value = "two".into());
+        shared.replace_payload(State::default(), |state, _| state.value = "three".into());
+        wait_for(&store, "three");
+        assert_eq!(store.load().unwrap().revision, 3);
     }
 
     #[test]
