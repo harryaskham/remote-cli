@@ -345,11 +345,72 @@ pub struct ServerHandle {
     pub loopback_address: Option<SocketAddr>,
     pub unix_socket: Option<PathBuf>,
     stop: Arc<AtomicBool>,
+    wake: Arc<Wake>,
 }
 
 impl ServerHandle {
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.wake();
+    }
+}
+
+/// Ends the accept loops' wait when the server stops. They sleep in the
+/// kernel until a client connects; without this they could only notice a
+/// stop by looking again every few milliseconds, forty wake-ups a second
+/// for an idle listener and up to 25 ms added to every request.
+struct Wake {
+    #[cfg(unix)]
+    ends: Option<(
+        std::os::unix::net::UnixStream,
+        std::os::unix::net::UnixStream,
+    )>,
+}
+
+impl Wake {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            let ends = std::os::unix::net::UnixStream::pair().ok();
+            if let Some((_, write)) = &ends {
+                // One byte per stop into an empty buffer; never wait for room.
+                write.set_nonblocking(true).ok();
+            }
+            Self { ends }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    /// The byte is never read, so every accept loop sees it.
+    fn wake(&self) {
+        #[cfg(unix)]
+        if let Some(ends) = &self.ends {
+            let _ = (&ends.1).write(&[1]);
+        }
+    }
+
+    /// Wait until `listener` has a client or the server stops. Returning
+    /// early (a signal, or no wake socket) only makes the loop look again.
+    #[cfg(unix)]
+    fn wait_for_client(&self, listener: &impl std::os::fd::AsFd) {
+        use rustix::event::{PollFd, PollFlags, poll};
+        let Some((read, _)) = &self.ends else {
+            thread::sleep(Duration::from_millis(25));
+            return;
+        };
+        let mut waiting = [
+            PollFd::new(listener, PollFlags::IN),
+            PollFd::new(read, PollFlags::IN),
+        ];
+        if poll(&mut waiting, None).is_err() {
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn wait_for_client<L>(&self, _listener: &L) {
+        thread::sleep(Duration::from_millis(25));
     }
 }
 
@@ -368,6 +429,7 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
         bail!("daemon bearer token is empty or too short");
     }
     let stop = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Wake::new());
     let shared_options = Arc::new(options);
     let mut http_address = None;
     let mut loopback_address = None;
@@ -379,7 +441,7 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
     {
         let listener = TcpListener::bind(bind)
             .with_context(|| format!("bind {} daemon HTTP server at {bind}", S::DISPLAY_NAME))?;
-        let address = spawn_tcp_listener(listener, &shared_options, &stop)?;
+        let address = spawn_tcp_listener(listener, &shared_options, &stop, &wake)?;
         http_address = Some(address);
 
         // Default loopback alias: a specific non-loopback bind (e.g. a Tailscale
@@ -395,7 +457,7 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
                         S::DISPLAY_NAME
                     )
                 })?;
-                let address = spawn_tcp_listener(listener, &shared_options, &stop)?;
+                let address = spawn_tcp_listener(listener, &shared_options, &stop, &wake)?;
                 loopback_address = Some(address);
             }
         }
@@ -424,7 +486,8 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
         listener.set_nonblocking(true)?;
         let options = Arc::clone(&shared_options);
         let listener_stop = Arc::clone(&stop);
-        thread::spawn(move || accept_unix(listener, options, listener_stop));
+        let listener_wake = Arc::clone(&wake);
+        thread::spawn(move || accept_unix(listener, options, listener_stop, listener_wake));
         Some(path.clone())
     } else {
         None
@@ -440,6 +503,7 @@ pub fn start_server<S: Snapshot>(options: ServerOptions<S>) -> Result<ServerHand
         loopback_address,
         unix_socket,
         stop,
+        wake,
     })
 }
 
@@ -450,12 +514,14 @@ fn spawn_tcp_listener<S: Snapshot>(
     listener: TcpListener,
     shared_options: &Arc<ServerOptions<S>>,
     stop: &Arc<AtomicBool>,
+    wake: &Arc<Wake>,
 ) -> Result<SocketAddr> {
     listener.set_nonblocking(true)?;
     let address = listener.local_addr().context("read daemon HTTP address")?;
     let options = Arc::clone(shared_options);
     let listener_stop = Arc::clone(stop);
-    thread::spawn(move || accept_tcp(listener, options, listener_stop));
+    let listener_wake = Arc::clone(wake);
+    thread::spawn(move || accept_tcp(listener, options, listener_stop, listener_wake));
     Ok(address)
 }
 
@@ -496,6 +562,7 @@ fn accept_tcp<S: Snapshot>(
     listener: TcpListener,
     options: Arc<ServerOptions<S>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<Wake>,
 ) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
@@ -526,7 +593,7 @@ fn accept_tcp<S: Snapshot>(
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                wake.wait_for_client(&listener);
             }
             Err(error) => {
                 eprintln!("{} daemon: accept failed: {error}", S::APP_NAME);
@@ -542,6 +609,7 @@ fn accept_unix<S: Snapshot>(
     listener: std::os::unix::net::UnixListener,
     options: Arc<ServerOptions<S>>,
     stop: Arc<AtomicBool>,
+    wake: Arc<Wake>,
 ) {
     while !stop.load(Ordering::Acquire) {
         match listener.accept() {
@@ -564,7 +632,7 @@ fn accept_unix<S: Snapshot>(
                 });
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(25));
+                wake.wait_for_client(&listener);
             }
             Err(error) => {
                 eprintln!("{} daemon: Unix accept failed: {error}", S::APP_NAME);
@@ -1585,6 +1653,50 @@ mod tests {
         let handle = start_server(options).unwrap();
         assert!(handle.http_address.is_some());
         assert!(handle.loopback_address.is_none());
+    }
+
+    #[test]
+    fn listeners_wait_for_clients_and_close_when_the_server_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CacheStore::new(dir.path().join("state.json"));
+        let shared = Arc::new(SharedSnapshot::new(State::default(), store));
+        let mut options = ServerOptions::new(Arc::clone(&shared), "x".repeat(64));
+        options.bind = Some("127.0.0.1:0".into());
+        #[cfg(unix)]
+        {
+            options.unix_socket = Some(dir.path().join("daemon.sock"));
+        }
+        let handle = start_server(options).unwrap();
+        let address = handle.http_address.unwrap();
+        // However long the listener has been idle, a client is answered.
+        thread::sleep(Duration::from_millis(150));
+        for _ in 0..3 {
+            let mut stream = std::net::TcpStream::connect(address).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .unwrap();
+            let mut reply = [0_u8; 9];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"HTTP/1.1 ");
+        }
+        // Stopping wakes the accept loops, and they close their listeners.
+        handle.stop();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::net::TcpStream::connect(address).is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "the listener outlived the server"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        #[cfg(unix)]
+        while std::os::unix::net::UnixStream::connect(dir.path().join("daemon.sock")).is_ok() {
+            assert!(Instant::now() < deadline, "the socket outlived the server");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]

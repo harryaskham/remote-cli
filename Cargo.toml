@@ -27,6 +27,10 @@ serde_json = "1"
 url = "2"
 tempfile = "3"
 
+[target.'cfg(unix)'.dependencies]
+# Safe poll(2): the accept loops sleep until a client connects or the server stops.
+rustix = { version = "1", features = ["event"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 
